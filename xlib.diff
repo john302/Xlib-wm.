@@ -1,0 +1,161 @@
+--- original.c
++++ modified.c
+@@ -10,6 +10,7 @@ typedef struct {
+ } MenuItem;
+
+ // Update Client struct to store client window
++// (No changes here)
+ typedef struct {
+     Window window;      // Frame window
+     Window client;      // Client window
+@@ -32,6 +33,7 @@ int client_count = 0;
+ Window menu_window = None;
+ int menu_height = 20;
+ int menu_width = 400;
++Atom wm_protocols;
+ int menu_visible = 0;
+ int dragging = 0;
+ int drag_start_x, drag_start_y;
+@@ -53,6 +55,7 @@ void init_x(void);
+ void cleanup_x(void);
+ void handle_events(void);
+ void create_root_menu(void);
++int supports_delete(Window w);
+ void load_config(void);
+ void draw_frame();
+ void manage_window(Window w);
+@@ -88,6 +91,7 @@ void init_x(void) {
+         exit(1);
+     }
+
++    wm_protocols = XInternAtom(display, "WM_PROTOCOLS", False);
+     screen = DefaultScreen(display);
+     root = RootWindow(display, screen);
+
+@@ -113,6 +117,25 @@ void cleanup_x(void) {
+     }
+ }
+
++int supports_delete(Window w) {
++    Atom *protocols;
++    int n = 0;
++    Atom wm_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
++
++    if (XGetWMProtocols(display, w, &protocols, &n)) {
++        for (int i = 0; i < n; i++) {
++            if (protocols[i] == wm_delete) {
++                XFree(protocols);
++                return 1;
++            }
++        }
++        XFree(protocols);
++    }
++
++    return 0;
++}
++
++
+ /* New function to close the window properly.*/
+
+ void close_window(Window frame) {
+@@ -121,28 +144,22 @@ void close_window(Window frame) {
+         if (clients[i].window == frame) {
+             printf("close_window: Found frame %lu, client %lu at index %d\n", frame, clients[i].client, i);
+             //Window root_ret, parent_ret;
+-            //Window *children;
+-            //unsigned int n;
+-            /*
+-            if (XQueryTree(display, frame, &root_ret, &parent_ret, &children, &n)) {
+-                for (unsigned int j = 0; j < n; j++) {
+-                    printf("close_window: Destroying child %lu\n", children[j]);
+-                    XDestroyWindow(display, children[j]);
+-                }
+-                XFree(children);
+-            } */
+-            XDestroyWindow(display, frame);
+-            //printf("close_window: Frame %lu destroyed\n", frame);
+-            unmanage_window(frame);
+-            //printf("close_window: unmanage_window called for frame %lu\n", frame);
++            Window client = clients[i].client;
++            Atom wm_delete = XInternAtom(display, "WM_DELETE_WINDOW", False);
++            if (supports_delete(client)) {
++                XEvent ev;
++                memset(&ev, 0, sizeof(ev));
++                ev.type = ClientMessage;
++                ev.xclient.window = client;
++                ev.xclient.message_type = wm_protocols;
++                ev.xclient.format = 32;
++                ev.xclient.data.l[0] = wm_delete;
++                ev.xclient.data.l[1] = CurrentTime;
++                XSendEvent(display, client, False, NoEventMask, &ev);
++            } else {
++                XKillClient(display, client);
++            }
+             break;
+         }
+     }
+-    if (i == client_count) {
+-        printf("close_window: Frame %lu not found in clients array\n", frame);
+-    }
+ }
+
+ // New function to draw menu
+@@ -286,7 +303,7 @@ void handle_button_press(XButtonEvent *e) {
+     for (int i = 0; i < client_count; i++) {
+         if (clients[i].window == e->window) {
+             if (e->y < 20 && e->x > (clients[i].width - 20)) {
+-                printf("handle_button_press: Close button clicked on frame %lu\n", e->window);
++                printf("handle_button_press: Close button clicked on frame %lu, initiating close\n", e->window);
+                 close_window(e->window);
+                 return;
+             }
+@@ -373,7 +390,7 @@ void draw_frame(Window frame) {
+     XWindowAttributes attrs;
+     XGetWindowAttributes(display, frame, &attrs);
+     int frame_width = attrs.width;
+-
++
+     // Draw title bar (full width of frame)
+     XDrawRectangle(display, frame, gc, 0, 0, frame_width, 20);
+
+@@ -424,6 +441,7 @@ void manage_window(Window w) {
+     clients[client_count].height = xwa.height + title_height;
+     clients[client_count].is_mapped = 1;
+     client_count++;
++    draw_frame(frame);  // Draw initial frame
+ }
+
+ void unmanage_window(Window frame) {
+@@ -435,16 +453,20 @@ void unmanage_window(Window frame) {
+         if (clients[i].window == frame) {
+             printf("unmanage_window: Found frame %lu, client %lu at index %d\n", frame, clients[i].client, i);
+             Window client = clients[i].client;
+-            Window root_ret, parent_ret;
+-            Window *children;
+-            unsigned int n;
+-            if (XQueryTree(display, frame, &root_ret, &parent_ret, &children, &n) && n > 0) {
+-                printf("unmanage_window: Reparenting client %lu to root\n", client);
+-                XReparentWindow(display, client, root, clients[i].x, clients[i].y - 20);
+-                XRemoveFromSaveSet(display, client);
+-                XFree(children);
+-            } else {
+-                printf("unmanage_window: XQueryTree failed or no children for frame %lu\n", frame);
++            XWindowAttributes wa;
++            if (XGetWindowAttributes(display, client, &wa)) {
++                printf("unmanage_window: Client %lu exists, reparenting to root\n", client);
++                XReparentWindow(display, client, root, clients[i].x, clients[i].y - 20);
++                XRemoveFromSaveSet(display, client);
++            } else {
++                printf("unmanage_window: Client %lu already destroyed, skipping reparent\n", client);
++            }
++
++            // Destroy the frame window
++            printf("unmanage_window: Destroying frame %lu\n", frame);
++            XDestroyWindow(display, frame);
++
++            // Remove from clients array
++            memmove(&clients[i], &clients[i + 1], (client_count - i - 1) * sizeof(Client));
++            client_count--;
++            clients = realloc(clients, client_count * sizeof(Client));
++            if (clients == NULL && client_count > 0) {
+             }
